@@ -18,6 +18,7 @@ Adapted EasyMagpieTTSModel class for classifier-free guidance distillation.
 import copy
 import json
 import random
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from io import TextIOWrapper
@@ -795,6 +796,9 @@ class _TeacherOutput:
 
     codes_lt: Optional[Tensor]
     logits_lt: Optional[Tensor]
+
+    # CPU-observed wall times in seconds, without explicit CUDA synchronization.
+    timing_metrics: dict[str, float] = field(default_factory=dict)
 
 
 def _validate_predicted_codes(
@@ -1871,7 +1875,8 @@ class _TeacherInferenceEngine:
 
         Returns:
             Teacher-rollout output containing finalized backbone codes, logits, and
-            lengths; optional local-transformer predictions; and rejection metadata.
+            lengths; optional local-transformer predictions; rejection metadata; and
+            CPU-observed generation-loop and total rollout wall times in seconds.
 
         Raises:
             ValueError: If local-transformer predictions are requested for a non-AR
@@ -1896,6 +1901,7 @@ class _TeacherInferenceEngine:
         use_rollout_rejection = lower_rejection_threshold is not None or upper_rejection_threshold is not None
 
         with torch.no_grad():
+            rollout_start_time = time.perf_counter()
             state = self._streaming_init(
                 context_audio_codes=batch["context_audio_codes"],
                 context_audio_codes_lens=batch["context_audio_codes_lens"],
@@ -1913,6 +1919,7 @@ class _TeacherInferenceEngine:
                 rejection_weight=rejection_weight,
             )
             logging.info("Generation started")
+            generation_start_time = time.perf_counter()
 
             while not state.finished.all() and len(state.pred_codes) < max_decoder_steps:
                 positions = state.text_tokens_seen.clamp(max=text.size(1) - 1)
@@ -1929,6 +1936,8 @@ class _TeacherInferenceEngine:
                     state = self._apply_rollout_upper_bound_rejection(
                         state, batch, upper_rejection_threshold, rejection_weight
                     )
+
+            rollout_generation_time = time.perf_counter() - generation_start_time
 
             if use_rollout_rejection and not state.finished.all():
                 state = self._apply_max_steps_rejection(
@@ -1963,6 +1972,10 @@ class _TeacherInferenceEngine:
             rejected_count = int(teacher_output.rejected.sum().item())
             logging.info(f"Total rejected samples in batch: {rejected_count}/{bs}.")
 
+        teacher_output.timing_metrics = {
+            "rollout_generation_time": rollout_generation_time,
+            "rollout_total_time": time.perf_counter() - rollout_start_time,
+        }
         return teacher_output
 
 
@@ -2107,6 +2120,12 @@ class _LanguageMetricKey(str, Enum):
     wer_list = "wer_list"
 
 
+_ROLLOUT_TIMING_KEYS: list[str] = [
+    "rollout_generation_time",
+    "rollout_total_time",
+]
+
+
 _MONITORED_KEYS_TRAIN: list[str] = [
     _get_loss_key(_LossKey.kl_loss),
     _get_loss_key(_LossKey.ce_loss),
@@ -2127,6 +2146,9 @@ _MONITORED_KEYS_VALID: list[str] = [
     _MetricKey.ssim.value,
     _MetricKey.utmos.value,
 ]
+
+
+_ON_EPOCH_TRAIN_KEYS: set[str] = set(_MONITORED_KEYS_TRAIN)
 
 
 @dataclass
@@ -3878,7 +3900,8 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
 
         Generates teacher targets for the batch, optionally records rejected rollouts,
         updates the batch with teacher outputs, and computes student distillation
-        losses. During training with rollout rejection enabled, also reports the
+        losses. Reports generation-loop and total teacher rollout wall times in
+        seconds. During training with rollout rejection enabled, also reports the
         teacher-rollout rejection rate.
 
         Args:
@@ -3918,6 +3941,9 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         student_output = self._process_batch(batch, use_lt, mode)
         output = self._compute_loss(batch, teacher_output, student_output, use_lt)
 
+        for key, value in teacher_output.timing_metrics.items():
+            output[key] = torch.tensor(value, device=self.device)
+
         if mode == "train" and self.use_rollout_rejection:
             output[_MetricKey.rejection_rate.value] = _compute_rejection_rate(teacher_output)
 
@@ -3928,7 +3954,10 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
         batch: dict[str, Tensor | list],
         batch_idx: int,
     ) -> Tensor:
-        """Run one CFG-distillation optimization step and logs training metrics.
+        """Run one CFG-distillation optimization step and log training metrics.
+
+        Logs worker-averaged ``train/rollout_generation_time`` and ``train/rollout_total_time``
+        in seconds per batch, on each step and averaged over the epoch.
 
         Args:
             batch: Collated training batch.
@@ -3952,7 +3981,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
             on_step=True,
             on_epoch=True,
         )
-        for key in _MONITORED_KEYS_TRAIN:
+        for key in (*_MONITORED_KEYS_TRAIN, *_ROLLOUT_TIMING_KEYS):
             if key in outputs:
                 self.log(
                     name=f"train/{key}",
@@ -3961,7 +3990,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
                     sync_dist=True,
                     batch_size=bs,
                     on_step=True,
-                    on_epoch=True,
+                    on_epoch=key in _ON_EPOCH_TRAIN_KEYS,
                 )
 
         if (
@@ -4183,6 +4212,8 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
     ) -> None:
         """Aggregate and log validation loss and monitored metrics.
 
+        Rollout times are averaged over validation batches and workers, in seconds.
+
         Args:
             val_outputs: Per-batch validation outputs from one dataloader or from all
                 validation dataloaders.
@@ -4211,7 +4242,7 @@ class EasyMagpieCFGDistillation(EasyMagpieTTSModel):
                     enable_graph=False,
                 )
 
-        for key in _MONITORED_KEYS_VALID:
+        for key in (*_MONITORED_KEYS_VALID, *_ROLLOUT_TIMING_KEYS):
             value = _collect_validation_outputs(val_outputs, key)
             if value is not None:
                 self.log(
